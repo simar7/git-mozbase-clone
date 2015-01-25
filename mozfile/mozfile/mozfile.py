@@ -11,7 +11,18 @@ import errno
 import os
 import stat
 import time
+import subprocess
 import warnings
+import logging
+log = logging.getLogger(__name__)
+
+import platform
+try:
+    import win32file
+    import win32api
+    PYWIN32 = True
+except ImportError:
+    PYWIN32 = False
 
 __all__ = ['extract_tarball',
            'extract_zip',
@@ -420,3 +431,81 @@ def load(resource):
 
     return urllib2.urlopen(resource)
 
+def merge_env(env):
+    new_env = os.environ.copy()
+    new_env.update(env)
+    return new_env
+
+def log_cmd(cmd, **kwargs):
+    # cwd is special in that we always want it printed, even if it's not
+    # explicitly chosen
+    kwargs = kwargs.copy()
+    if 'cwd' not in kwargs:
+        kwargs['cwd'] = os.getcwd()
+    log.info("command: START")
+    log.info("command: %s" % subprocess.list2cmdline(cmd))
+    for key, value in kwargs.iteritems():
+        log.info("command: %s: %s", key, str(value))
+
+def run_cmd(cmd, **kwargs):
+    """Run cmd (a list of arguments).  Raise subprocess.CalledProcessError if
+    the command exits with non-zero.  If the command returns successfully,
+    return 0."""
+    log_cmd(cmd, **kwargs)
+    # We update this after logging because we don't want all of the inherited
+    # env vars muddling up the output
+    if 'env' in kwargs:
+        kwargs['env'] = merge_env(kwargs['env'])
+    try:
+        t = time.time()
+        log.info("command: output:")
+        return subprocess.check_call(cmd, **kwargs)
+    except subprocess.CalledProcessError:
+        log.info('command: ERROR', exc_info=True)
+        raise
+    finally:
+        elapsed = time.time() - t
+        log.info("command: END (%.2fs elapsed)\n", elapsed)
+
+def _is_windows():
+    system = platform.system()
+    if system in ("Windows", "Microsoft"):
+        return True
+    if system.startswith("CYGWIN"):
+        return True
+    if os.name == 'nt':
+        return True
+
+def _rmtree_windows(path):
+    """ Windows-specific rmtree that handles path lengths longer than MAX_PATH.
+        Ported from clobberer.py.
+    """
+    assert _is_windows()
+    path = os.path.realpath(path)
+    full_path = '\\\\?\\' + path
+    if not os.path.exists(full_path):
+        return
+    if not PYWIN32:
+        if not os.path.isdir(path):
+            return run_cmd('del /F /Q "%s"' % path)
+        else:
+            return run_cmd('rmdir /S /Q "%s"' % path)
+    # Make sure directory is writable
+    win32file.SetFileAttributesW('\\\\?\\' + path, win32file.FILE_ATTRIBUTE_NORMAL)
+    # Since we call rmtree() with a file, sometimes
+    if not os.path.isdir('\\\\?\\' + path):
+        return win32file.DeleteFile('\\\\?\\' + path)
+
+    for ffrec in win32api.FindFiles('\\\\?\\' + path + '\\*.*'):
+        file_attr = ffrec[0]
+        name = ffrec[8]
+        if name == '.' or name == '..':
+            continue
+        full_name = os.path.join(path, name)
+
+        if file_attr & win32file.FILE_ATTRIBUTE_DIRECTORY:
+            _rmtree_windows(full_name)
+        else:
+            win32file.SetFileAttributesW('\\\\?\\' + full_name, win32file.FILE_ATTRIBUTE_NORMAL)
+            win32file.DeleteFile('\\\\?\\' + full_name)
+    win32file.RemoveDirectory('\\\\?\\' + path)
